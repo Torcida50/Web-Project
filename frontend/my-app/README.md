@@ -27,11 +27,13 @@ cd backend
 .venv\Scripts\activate
 pip install pandas
 pip install altair
-uvicorn main:app --reload
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 ### Frontend - Ablauf
 
+```bash
 cd frontend/my-app
 npm install
 npm run dev
+```

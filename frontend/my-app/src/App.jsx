@@ -1,87 +1,128 @@
 import { useState, useEffect } from "react";
 import VegaTimeseries from "./components/VegaTimeseries";
+import VegaFokusLast7All from "./components/VegaFokusLast7All";
 import "./App.css";
+
+const API_BASE = "http://127.0.0.1:8000";
+
+async function fetchJson(url, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} bei ${url}`);
+    }
+    return await res.json();
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      throw new Error(`Timeout nach ${timeoutMs}ms bei ${url}`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 export default function App() {
   const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(true); // Ladezustand
-  const [error, setError] = useState(null); // Fehlerzustand
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   const [activatePage, setActivatePage] = useState("uebersicht");
 
-  // NEU: Standorte + Auswahl + Analyse-Ergebnis
+  // Standorte + Auswahl + Analyse-Ergebnis
   const [standorte, setStandorte] = useState([]);
   const [selectedStandort, setSelectedStandort] = useState("");
   const [analyseResult, setAnalyseResult] = useState(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
 
+  // Daten Preview
   useEffect(() => {
-    // Daten vom Backend holen (Preview des Gesamtdatensatzes)
-    fetch("http://127.0.0.1:8000/daten/preview")
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error("Antwort vom Server war nicht OK");
-        }
-        return response.json();
-      })
-      .then((data) => {
-        setRows(data);
-        setLoading(false);
-      })
-      .catch((err) => {
-        console.error("Fehler beim Laden der Daten:", err);
-        setError(err.message);
-        setLoading(false);
-      });
+    let cancelled = false;
+
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await fetchJson(`${API_BASE}/daten/preview`);
+        if (cancelled) return;
+        setRows(Array.isArray(data) ? data : []);
+      } catch (e) {
+        if (cancelled) return;
+        console.error("Fehler beim Laden der Daten:", e);
+        setError(e.message || "Fehler beim Laden");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
+  // Standorte laden
   useEffect(() => {
-    fetch("http://127.0.0.1:8000/analysis/standorte")
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error("Standorte konnten nicht geladen werden");
-        }
-        return response.json();
-      })
-      .then((data) => {
-        setStandorte(data);
+    let cancelled = false;
 
-        if (data.length > 0) {
-          setSelectedStandort(data[0]);
-          setAnalysisLoading(true);
-          setAnalysisError(null);
-          setAnalyseResult(null);
-        }
-      })
-      .catch((err) => {
-        console.error("Fehler beim Laden der Standorte:", err);
-        setAnalysisError(err.message);
-      });
+    (async () => {
+      setAnalysisError(null);
+      try {
+        const data = await fetchJson(`${API_BASE}/analysis/standorte`);
+        if (cancelled) return;
+        const list = Array.isArray(data) ? data : [];
+        setStandorte(list);
+        if (list.length > 0) setSelectedStandort(list[0]);
+      } catch (e) {
+        if (cancelled) return;
+        console.error("Fehler beim Laden der Standorte:", e);
+        setStandorte([]);
+        setSelectedStandort("");
+        setAnalysisError(e.message || "Standorte konnten nicht geladen werden");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
+  // Analyse fuer Standort laden
   useEffect(() => {
     if (!selectedStandort) return;
 
-    fetch(
-      `http://127.0.0.1:8000/analysis/erwachsene/${encodeURIComponent(
+    let cancelled = false;
+
+    (async () => {
+      setAnalysisLoading(true);
+      setAnalysisError(null);
+      setAnalyseResult(null);
+
+      const url = `${API_BASE}/analysis/erwachsene/${encodeURIComponent(
         selectedStandort
-      )}`
-    )
-      .then((res) => {
-        if (!res.ok) {
-          throw new Error("Analyse konnte nicht geladen werden");
-        }
-        return res.json();
-      })
-      .then((data) => {
+      )}`;
+
+      try {
+        const data = await fetchJson(url);
+        if (cancelled) return;
         setAnalyseResult(data);
-        setAnalysisLoading(false);
-      })
-      .catch((err) => {
-        setAnalysisError(err.message);
-        setAnalysisLoading(false);
-      });
+      } catch (e) {
+        if (cancelled) return;
+        setAnalysisError(e.message || "Analyse konnte nicht geladen werden");
+      } finally {
+        if (!cancelled) setAnalysisLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [selectedStandort]);
 
   return (
@@ -146,12 +187,27 @@ export default function App() {
                 Fussgänger, die nach rechts gehen, als solche, die nach links
                 gehen?
               </p>
+
+              <h3>Statische Visualisierung zur Fokusfrage (letzte 7 Tage)</h3>
+              <VegaFokusLast7All />
+
+              <p style={{ marginTop: "10px", opacity: 0.9 }}>
+                Dargestellt ist die Differenz (Delta) der erwachsenen Fussgänger
+                der letzten sieben Tage im Datensatz:{" "}
+                <strong>
+                  Erwachsene nach rechts minus Erwachsene nach links
+                </strong>
+                . Werte über 0 bedeuten, dass an diesem Tag mehr Erwachsene nach
+                rechts gingen; Werte unter 0 bedeuten entsprechend mehr nach
+                links. Die Null-Linie dient als Referenz.
+              </p>
             </>
           )}
 
           {activatePage === "daten" && (
             <>
               <h2>Daten</h2>
+              <p>Zeige Preview der Daten:</p>
 
               {loading && <p>Daten werden geladen...</p>}
 
@@ -196,24 +252,25 @@ export default function App() {
             <>
               <h2>Visualisierungen</h2>
 
-              <label>
-                Standort:{" "}
-                <select
-                  value={selectedStandort}
-                  onChange={(e) => {
-                    setAnalysisError(null);
-                    setAnalyseResult(null);
-                    setAnalysisLoading(true);
-                    setSelectedStandort(e.target.value);
-                  }}
-                >
-                  {standorte.map((s) => (
-                    <option key={s} value={s}>
-                      {s}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {standorte.length === 0 ? (
+                <p style={{ color: "red" }}>
+                  Keine Standorte geladen. Prüfe: {API_BASE}/analysis/standorte
+                </p>
+              ) : (
+                <label>
+                  Standort:{" "}
+                  <select
+                    value={selectedStandort}
+                    onChange={(e) => setSelectedStandort(e.target.value)}
+                  >
+                    {standorte.map((s) => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
 
               <div style={{ marginTop: "16px" }}>
                 {analysisLoading && <p>Analyse wird geladen...</p>}
@@ -247,6 +304,7 @@ export default function App() {
                 )}
               </div>
 
+              <h3>Zeitreihe</h3>
               <VegaTimeseries standort={selectedStandort} />
             </>
           )}
