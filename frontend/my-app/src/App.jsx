@@ -3,9 +3,9 @@ import VegaTimeseries from "./components/VegaTimeseries";
 import VegaFokusLast7All from "./components/VegaFokusLast7All";
 import "./App.css";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "/api";
 
-async function fetchJson(url, timeoutMs = 8000) {
+async function fetchJson(url, timeoutMs = 120000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -50,7 +50,7 @@ export default function App() {
       setLoading(true);
       setError(null);
       try {
-        const data = await fetchJson(`${API_BASE}/daten/preview`);
+        const data = await fetchJson(`${API_BASE}/daten/preview`, 30000);
         if (cancelled) return;
         setRows(Array.isArray(data) ? data : []);
       } catch (e) {
@@ -74,7 +74,7 @@ export default function App() {
     (async () => {
       setAnalysisError(null);
       try {
-        const data = await fetchJson(`${API_BASE}/analysis/standorte`);
+        const data = await fetchJson(`${API_BASE}/analysis/standorte`, 30000);
         if (cancelled) return;
         const list = Array.isArray(data) ? data : [];
         setStandorte(list);
@@ -109,7 +109,7 @@ export default function App() {
       )}`;
 
       try {
-        const data = await fetchJson(url);
+        const data = await fetchJson(url, 120000);
         if (cancelled) return;
         setAnalyseResult(data);
       } catch (e) {
@@ -207,7 +207,7 @@ export default function App() {
           {activatePage === "daten" && (
             <>
               <h2>Daten</h2>
-              <p>Zeige Preview der Daten:</p>
+              <p>Ein kleiner Ausschnitt der Daten:</p>
 
               {loading && <p>Daten werden geladen...</p>}
 

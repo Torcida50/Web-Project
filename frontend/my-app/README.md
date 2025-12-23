@@ -24,10 +24,11 @@ Die Anwendung besteht aus einem Backend (FastAPI) und einem Frontend
 
 ```bash
 cd backend
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 pip install pandas
 pip install altair
 uvicorn main:app --reload --host 127.0.0.1 --port 8000
+
 ```
 
 ### Frontend - Ablauf

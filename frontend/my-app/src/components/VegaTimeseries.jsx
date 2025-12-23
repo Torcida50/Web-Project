@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import vegaEmbed from "vega-embed";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "/api";
 
 /**
  * Verfuegbare Visualisierungstypen
@@ -12,7 +12,7 @@ const API_BASE = "http://127.0.0.1:8000";
 const VISUALISIERUNGEN = [
   { key: "direction", label: "Links / Rechts", fields: ["ltr", "rtl"] },
   { key: "age", label: "Erwachsene / Kinder", fields: ["adult", "child"] },
-  { key: "total", label: "Total Fussgaenger", fields: ["total"] },
+  { key: "total", label: "Total Fussgänger", fields: ["total"] },
   { key: "zones", label: "Zonen 1-3", fields: ["zone1", "zone2", "zone3"] },
 ];
 
@@ -39,11 +39,11 @@ export default function VegaTimeseries({ standort }) {
     setError(null);
     setRows([]);
 
-    const url = `${API_BASE}/api/timeseries/${encodeURIComponent(standort)}`;
+    const url = `${API_BASE}/timeseries/${encodeURIComponent(standort)}`;
 
-    // Timeout, damit "Failed to fetch" nicht ewig haengt
+    // Timeout, damit "Failed to fetch" nicht ewig besteht
     const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 8000);
+    const t = setTimeout(() => controller.abort(), 20000);
 
     fetch(url, { signal: controller.signal, cache: "no-store" })
       .then((res) => {
@@ -62,7 +62,7 @@ export default function VegaTimeseries({ standort }) {
 
         const msg =
           err?.name === "AbortError"
-            ? `Timeout nach 8000ms bei ${url}`
+            ? `Timeout nach 20000ms bei ${url}`
             : err?.message || `Fehler beim Laden (${url})`;
 
         setError(msg);
@@ -146,7 +146,7 @@ export default function VegaTimeseries({ standort }) {
         y: {
           field: multipleSeries ? "value" : fields[0],
           type: "quantitative",
-          title: "Anzahl Fussgaenger",
+          title: "Anzahl Fussgänger",
           axis: { format: ",.0f" },
           stack: null,
         },

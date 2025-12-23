@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import vegaEmbed from "vega-embed";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "/api";
+
 const ENDPOINT = "/analysis/erwachsene_last7_all";
+
+function toNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
 
 export default function VegaFokusLast7All() {
   const chartRef = useRef(null);
@@ -11,14 +17,14 @@ export default function VegaFokusLast7All() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // 1) Daten laden (mit Timeout + begrenztem Retry)
+  // Daten laden (mit Timeout + begrenztem Retry)
   useEffect(() => {
     let cancelled = false;
     let retryTimer = null;
 
     const MAX_RETRIES = 10;
     const RETRY_MS = 2000;
-    const TIMEOUT_MS = 8000;
+    const TIMEOUT_MS = 300000;
     let attempts = 0;
 
     async function loadOnce() {
@@ -41,7 +47,17 @@ export default function VegaFokusLast7All() {
         }
 
         const data = await res.json();
-        const nextRows = Array.isArray(data?.rows) ? data.rows : [];
+        const rawRows = Array.isArray(data?.rows) ? data.rows : [];
+
+        // normalisieren, damit Vega nie Infinity/NaN bekommt
+        const nextRows = rawRows
+          .map((r) => ({
+            date: r?.date ? String(r.date) : null,
+            adult_ltr: toNum(r?.adult_ltr),
+            adult_rtl: toNum(r?.adult_rtl),
+            delta: toNum(r?.delta),
+          }))
+          .filter((r) => r.date); // date muss vorhanden sein
 
         if (cancelled) return;
 
@@ -53,7 +69,9 @@ export default function VegaFokusLast7All() {
         }
 
         if (nextRows.length === 0 && attempts >= MAX_RETRIES) {
-          setError(`Keine Daten erhalten (rows leer). Prüfe: ${url}`);
+          setError(
+            `Keine Daten erhalten oder Daten ungueltig (rows leer). Prüfe: ${url}`
+          );
         }
       } catch (e) {
         if (cancelled) return;
@@ -85,7 +103,7 @@ export default function VegaFokusLast7All() {
     };
   }, []);
 
-  // 2) Vega-Lite Spec (statisch)
+  // Vega-Lite Spec (statisch)
   const spec = useMemo(() => {
     return {
       $schema: "https://vega.github.io/schema/vega-lite/v5.json",
@@ -100,7 +118,7 @@ export default function VegaFokusLast7All() {
           encoding: {
             x: {
               field: "date",
-              type: "ordinal",
+              type: "temporal",
               title: "Datum",
               axis: { labelAngle: 0 },
             },
@@ -111,7 +129,7 @@ export default function VegaFokusLast7All() {
               stack: null,
             },
             tooltip: [
-              { field: "date", type: "ordinal", title: "Datum" },
+              { field: "date", type: "temporal", title: "Datum" },
               {
                 field: "adult_ltr",
                 type: "quantitative",
@@ -134,9 +152,13 @@ export default function VegaFokusLast7All() {
     };
   }, [rows]);
 
-  // 3) Render Chart (nur wenn rows vorhanden)
+  // Render Chart (nur wenn rows vorhanden)
   useEffect(() => {
     if (!chartRef.current) return;
+
+    // Container leeren (verhindert mehrere SVGs übereinander)
+    chartRef.current.innerHTML = "";
+
     if (!rows || rows.length === 0) return;
 
     vegaEmbed(chartRef.current, spec, {
@@ -155,7 +177,8 @@ export default function VegaFokusLast7All() {
 
       {!loading && !error && rows.length === 0 && (
         <p style={{ color: "red" }}>
-          Keine Daten vom Backend erhalten (rows ist leer). Prüfe: {API_BASE}
+          Keine Daten vom Backend erhalten (rows ist leer/ungueltig). Prüfe:{" "}
+          {API_BASE}
           {ENDPOINT}
         </p>
       )}

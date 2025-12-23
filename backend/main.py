@@ -1,11 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import csv
 from functools import lru_cache
-from typing import List
+from typing import List, Optional, Dict, Any
 
-# pandas wird gebraucht (to_datetime). Wenn es fehlt, lieber klar crashen mit Message.
 try:
     import pandas as pd
 except ModuleNotFoundError as e:
@@ -19,10 +18,11 @@ app = FastAPI(
 )
 
 # CORS: Frontend darf zugreifen (localhost UND 127.0.0.1)
-# (5173 ist Vite Standard, 3000 ist optional)
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
@@ -40,21 +40,7 @@ DATA_DIR = Path(__file__).parent / "data"
 GESAMT_PATH = DATA_DIR / "Gesamtdatensatz.csv"
 
 
-def load_gesamtdaten():
-    """Laedt den gesamten Datensatz aus der CSV-Datei und gibt ihn als Liste von Dicts zurueck."""
-    if not GESAMT_PATH.exists():
-        return []
-
-    rows = []
-    with GESAMT_PATH.open(encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
-
-
-# Hilfsfunktion: Wert in Integer umwandeln (mit Default)
-def to_int(value, default=0):
+def to_int(value, default=0) -> int:
     try:
         if value is None or value == "":
             return default
@@ -64,9 +50,168 @@ def to_int(value, default=0):
 
 
 # -------------------------
+# CSV Cache (Performance) - OHNE Preprocessing
+# -------------------------
+_cached_rows: Optional[List[Dict[str, Any]]] = None
+_cached_mtime: Optional[float] = None
+
+
+def invalidate_all_caches():
+    """Wenn CSV neu geladen wird: alle abgeleiteten LRU-Caches leeren."""
+    cached_standorte.cache_clear()
+    cached_timeseries.cache_clear()
+    cached_lastN_all.cache_clear()
+
+
+def get_rows_cached() -> List[Dict[str, Any]]:
+    """Laedt CSV nur neu, wenn sie sich geaendert hat (mtime). OHNE teures Preprocessing."""
+    global _cached_rows, _cached_mtime
+
+    if not GESAMT_PATH.exists():
+        _cached_rows = []
+        _cached_mtime = None
+        invalidate_all_caches()
+        return []
+
+    mtime = GESAMT_PATH.stat().st_mtime
+    if _cached_rows is None or _cached_mtime != mtime:
+        rows: List[Dict[str, Any]] = []
+        with GESAMT_PATH.open(encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(row)
+
+        _cached_rows = rows
+        _cached_mtime = mtime
+        invalidate_all_caches()
+
+    return _cached_rows
+
+
+# Backward-compatible Wrapper
+def load_gesamtdaten():
+    return get_rows_cached()
+
+
+# -------------------------
+# Standorte (gecached)
+# -------------------------
+@lru_cache(maxsize=8)
+def cached_standorte(file_mtime: float):
+    rows = get_rows_cached()
+    standorte = set()
+    for r in rows:
+        name = (r.get("location_name") or "").strip()
+        if name:
+            standorte.add(name)
+    return sorted(standorte)
+
+
+# -------------------------
+# Letzte N Tage (ALLE Standorte) (gecached)
+# Cache-Key: (file_mtime, days)
+#
+# FIX: nicht mehr 2x ueber alle DictRows iterieren + pd.to_datetime pro Zeile,
+#      sondern CSV einmal in DataFrame lesen und vektorisiert aggregieren. -> viel schneller.
+# -------------------------
+@lru_cache(maxsize=64)
+def cached_lastN_all(file_mtime: float, days: int):
+    if not GESAMT_PATH.exists():
+        return {"rows": []}
+
+    # CSV einmal laden (nur benoetigte Spalten)
+    df = pd.read_csv(
+        GESAMT_PATH,
+        usecols=[
+            "timestamp",
+            "adult_ltr_pedestrians_count",
+            "adult_rtl_pedestrians_count",
+        ],
+    )
+
+    if df.empty or "timestamp" not in df.columns:
+        return {"rows": []}
+
+    # Timestamp einmal parsen (fehlerhafte -> NaT)
+    ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df[ts.notna()].copy()
+    df["date"] = ts[ts.notna()].dt.date
+
+    if df.empty:
+        return {"rows": []}
+
+    last_date = df["date"].max()
+    start_date = (pd.Timestamp(last_date) - pd.Timedelta(days=days - 1)).date()
+
+    df = df[(df["date"] >= start_date) & (df["date"] <= last_date)]
+
+    # Counts robust in int umwandeln
+    df["adult_ltr_pedestrians_count"] = pd.to_numeric(
+        df["adult_ltr_pedestrians_count"], errors="coerce"
+    ).fillna(0).astype(int)
+
+    df["adult_rtl_pedestrians_count"] = pd.to_numeric(
+        df["adult_rtl_pedestrians_count"], errors="coerce"
+    ).fillna(0).astype(int)
+
+    agg = (
+        df.groupby("date", as_index=False)[
+            ["adult_ltr_pedestrians_count", "adult_rtl_pedestrians_count"]
+        ]
+        .sum()
+        .sort_values("date")
+    )
+
+    out_rows = []
+    for _, r in agg.iterrows():
+        ltr = int(r["adult_ltr_pedestrians_count"])
+        rtl = int(r["adult_rtl_pedestrians_count"])
+        out_rows.append(
+            {
+                "date": str(r["date"]),
+                "adult_ltr": ltr,
+                "adult_rtl": rtl,
+                "delta": rtl - ltr,
+            }
+        )
+
+    return {"rows": out_rows}
+
+
+# -------------------------
+# Timeseries Cache (pro Standort)
+# -------------------------
+@lru_cache(maxsize=256)
+def cached_timeseries(file_mtime: float, standort: str):
+    rows = get_rows_cached()
+    standort = (standort or "").strip()
+
+    result = []
+    for r in rows:
+        if (r.get("location_name") or "").strip() != standort:
+            continue
+
+        result.append(
+            {
+                "timestamp": r.get("timestamp"),
+                "total": to_int(r.get("pedestrians_count")),
+                "ltr": to_int(r.get("ltr_pedestrians_count")),
+                "rtl": to_int(r.get("rtl_pedestrians_count")),
+                "adult": to_int(r.get("adult_pedestrians_count")),
+                "child": to_int(r.get("child_pedestrians_count")),
+                "zone1": to_int(r.get("zone_1_pedestrians_count")),
+                "zone2": to_int(r.get("zone_2_pedestrians_count")),
+                "zone3": to_int(r.get("zone_3_pedestrians_count")),
+            }
+        )
+
+    result.sort(key=lambda x: x["timestamp"] or "")
+    return result
+
+
+# -------------------------
 # Basis-Endpunkte
 # -------------------------
-
 @app.get("/")
 def root():
     return {"message": "Bahnhofstrasse Backend (Gesamtdatensatz) laeuft."}
@@ -78,20 +223,26 @@ def health():
 
 
 # -------------------------
-# Daten-Endpunkte (CSV)
+# Daten-Endpunkte (CSV)  (Pagination!)
 # -------------------------
-
 @app.get("/daten")
-def daten_gesamt():
-    """Gibt den gesamten Datensatz zurueck."""
-    return load_gesamtdaten()
+def daten_gesamt(
+    limit: int = Query(500, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+):
+    rows = get_rows_cached()
+    return {
+        "total": len(rows),
+        "limit": limit,
+        "offset": offset,
+        "rows": rows[offset: offset + limit],
+    }
 
 
 @app.get("/daten/preview")
 def daten_gesamt_preview():
-    """Gibt nur die ersten 10 Zeilen zurueck (Preview)."""
-    data = load_gesamtdaten()
-    return data[:10]
+    rows = get_rows_cached()
+    return rows[:10]
 
 
 @app.get("/debug/columns")
@@ -100,7 +251,7 @@ def debug_columns():
     if not GESAMT_PATH.exists():
         return {"error": f"CSV nicht gefunden: {GESAMT_PATH}"}
 
-    with GESAMT_PATH.open("r", encoding="utf-8") as f:
+    with GESAMT_PATH.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         return {"columns": reader.fieldnames}
 
@@ -108,14 +259,13 @@ def debug_columns():
 # -------------------------
 # Analysis-Endpunkte
 # -------------------------
-
 @app.get("/analysis/erwachsene")
 def analyse_erwachsene():
     """
     Beispiel-Analyse (nur falls eure CSV wirklich 'altersgruppe'/'richtung' hat).
     Achtung: Das ist bei euch evtl. nicht mehr relevant.
     """
-    data = load_gesamtdaten()
+    data = get_rows_cached()
 
     links = 0
     rechts = 0
@@ -130,32 +280,8 @@ def analyse_erwachsene():
     return {"links": links, "rechts": rechts}
 
 
-# -------------------------
-# Standorte (gecached)
-# Cache wird automatisch invalidiert, wenn sich die CSV aendert
-# -------------------------
-
-@lru_cache(maxsize=8)
-def cached_standorte(file_mtime: float):
-    # file_mtime ist nur da, um den Cache bei Datei-Aenderung zu invalidieren
-    if not GESAMT_PATH.exists():
-        return []
-
-    standorte = set()
-    with GESAMT_PATH.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name = (row.get("location_name") or "").strip()
-            if name:
-                standorte.add(name)
-
-    return sorted(standorte)
-
-
-# ✅ HIER ist die wichtige Aenderung:
 @app.get("/analysis/standorte", response_model=List[str])
 def list_standorte():
-    """Gibt alle eindeutigen location_name zurueck (gecached)."""
     if not GESAMT_PATH.exists():
         return []
     mtime = GESAMT_PATH.stat().st_mtime
@@ -174,15 +300,16 @@ def analyse_erwachsene_standort(standort: str):
     if not GESAMT_PATH.exists():
         return {"error": f"CSV nicht gefunden: {GESAMT_PATH}"}
 
+    rows = get_rows_cached()
+    standort = (standort or "").strip()
+
     sum_ltr = 0
     sum_rtl = 0
 
-    with GESAMT_PATH.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if (row.get("location_name") or "").strip() == standort:
-                sum_ltr += to_int(row.get("adult_ltr_pedestrians_count"))
-                sum_rtl += to_int(row.get("adult_rtl_pedestrians_count"))
+    for r in rows:
+        if (r.get("location_name") or "").strip() == standort:
+            sum_ltr += to_int(r.get("adult_ltr_pedestrians_count"))
+            sum_rtl += to_int(r.get("adult_rtl_pedestrians_count"))
 
     return {
         "standort": standort,
@@ -192,136 +319,35 @@ def analyse_erwachsene_standort(standort: str):
     }
 
 
-# -------------------------
-# Letzte 7 Tage (ALLE Standorte)
-# Cache wird automatisch invalidiert, wenn sich die CSV aendert
-# -------------------------
-
-def _compute_last7_all():
-    """
-    Letzte 7 Tage (basierend auf letztem Datum im Datensatz),
-    aggregiert ueber alle Standorte: Erwachsene links/rechts + delta pro Tag.
-    Optimiert: 2 CSV-Durchlaeufe, kein pandas DataFrame.
-    """
-    if not GESAMT_PATH.exists():
-        return {"rows": [], "error": f"CSV nicht gefunden: {GESAMT_PATH}"}
-
-    # 1) Letztes Datum finden
-    last_date = None
-    with GESAMT_PATH.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ts = row.get("timestamp")
-            if not ts:
-                continue
-            try:
-                d = pd.to_datetime(ts, utc=True).date()
-            except Exception:
-                continue
-
-            if last_date is None or d > last_date:
-                last_date = d
-
-    if last_date is None:
-        return {"rows": []}
-
-    start_date = (pd.Timestamp(last_date) - pd.Timedelta(days=6)).date()
-
-    # 2) Aggregieren (nur letzte 7 Tage)
-    sums = {}  # date -> {"adult_ltr": x, "adult_rtl": y}
-
-    with GESAMT_PATH.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ts = row.get("timestamp")
-            if not ts:
-                continue
-            try:
-                d = pd.to_datetime(ts, utc=True).date()
-            except Exception:
-                continue
-
-            if d < start_date or d > last_date:
-                continue
-
-            if d not in sums:
-                sums[d] = {"adult_ltr": 0, "adult_rtl": 0}
-
-            sums[d]["adult_ltr"] += to_int(row.get("adult_ltr_pedestrians_count"))
-            sums[d]["adult_rtl"] += to_int(row.get("adult_rtl_pedestrians_count"))
-
-    out_rows = []
-    for d in sorted(sums.keys()):
-        adult_ltr = sums[d]["adult_ltr"]
-        adult_rtl = sums[d]["adult_rtl"]
-        out_rows.append(
-            {
-                "date": str(d),
-                "adult_ltr": int(adult_ltr),
-                "adult_rtl": int(adult_rtl),
-                "delta": int(adult_rtl - adult_ltr),
-            }
-        )
-
-    return {"rows": out_rows}
-
-
-@lru_cache(maxsize=8)
-def cached_last7_all(file_mtime: float):
-    # file_mtime ist nur da, um den Cache bei Datei-Aenderung zu invalidieren
-    return _compute_last7_all()
-
-
 @app.get("/analysis/erwachsene_last7_all")
-def analyse_erwachsene_last7_all():
+def erwachsene_last7_all(days: int = Query(7, ge=1, le=60)):
     if not GESAMT_PATH.exists():
         return {"rows": [], "error": f"CSV nicht gefunden: {GESAMT_PATH}"}
     mtime = GESAMT_PATH.stat().st_mtime
-    return cached_last7_all(mtime)
+    return cached_lastN_all(mtime, days)
 
 
 @app.get("/analysis/erwachsene_last7_all/refresh")
 def refresh_erwachsene_last7_all():
-    cached_last7_all.cache_clear()
+    cached_lastN_all.cache_clear()
     return {"status": "cache cleared"}
 
 
 # -------------------------
-# Timeseries-Endpunkt fuer VegaTimeseries
+# Timeseries-Endpunkt (gecached pro Standort)
 # -------------------------
-
-@app.get("/api/timeseries/{standort}")
+@app.get("/timeseries/{standort}")
 def timeseries_standort(standort: str):
-    """
-    Zeitreihe pro Standort:
-    timestamp + verschiedene Zaehlungen (total, ltr, rtl, adult, child, zones...)
-    """
     if not GESAMT_PATH.exists():
         return []
+    mtime = GESAMT_PATH.stat().st_mtime
+    return cached_timeseries(mtime, standort)
 
-    result = []
-    with GESAMT_PATH.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if (row.get("location_name") or "").strip() != standort:
-                continue
 
-            result.append(
-                {
-                    "timestamp": row.get("timestamp"),
-                    "total": to_int(row.get("pedestrians_count")),
-                    "ltr": to_int(row.get("ltr_pedestrians_count")),
-                    "rtl": to_int(row.get("rtl_pedestrians_count")),
-                    "adult": to_int(row.get("adult_pedestrians_count")),
-                    "child": to_int(row.get("child_pedestrians_count")),
-                    "zone1": to_int(row.get("zone_1_pedestrians_count")),
-                    "zone2": to_int(row.get("zone_2_pedestrians_count")),
-                    "zone3": to_int(row.get("zone_3_pedestrians_count")),
-                }
-            )
-
-    result.sort(key=lambda x: x["timestamp"] or "")
-    return result
+@app.get("/timeseries/refresh")
+def refresh_timeseries_cache():
+    cached_timeseries.cache_clear()
+    return {"status": "cache cleared"}
 
 
 # -------------------------
@@ -329,4 +355,4 @@ def timeseries_standort(standort: str):
 # -------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
